@@ -78,15 +78,18 @@ local function update_license(email)
     local expiration_date
 
     if license and license.fields and license.fields.expirationDate then
-        -- Se a licença já existe, adiciona mais 1 dia
+        -- Se a licença já existe, verifica se expirou
         local current_expiration = license.fields.expirationDate.timestampValue
         local year, month, day = current_expiration:match("(%d+)-(%d+)-(%d+)")
         local expiration_time = os.time({ year = tonumber(year), month = tonumber(month), day = tonumber(day) })
-        
+
         if os.time() > expiration_time then
-            expiration_date = get_firestore_timestamp(1)  -- Se expirou, adiciona 1 dia
+            -- Só se expirou, adiciona 1 dia
+            expiration_date = get_firestore_timestamp(1)
         else
-            expiration_date = get_firestore_timestamp(1 + os.difftime(expiration_time, os.time()) / 86400)
+            -- Ainda está ativa, não atualiza
+            print("Licença ainda válida até " .. current_expiration)
+            return false
         end
     else
         -- Se não tem licença, cria uma nova com 1 dia grátis
@@ -119,6 +122,7 @@ local function update_license(email)
         return false
     end
 end
+
 
 -- Função para calcular a diferença entre a data de expiração e a data atual
 local function calculate_time_remaining(expiration_timestamp)
