@@ -1,0 +1,293 @@
+local diretorio = Engine.getScriptsDirectory()
+local diretorio_anterior = diretorio:match("^(.*[/\\])Scripts[/\\]?$")
+local caminho_arquivo = diretorio_anterior .. "zerobot.son"  -- Caminho do arquivo
+
+-- Função para ler o arquivo
+local function lerArquivo(caminho)
+    local file = io.open(caminho, "r")
+    if not file then
+        print("Erro ao abrir o arquivo: " .. caminho)
+        return nil
+    end
+    local conteudo = file:read("*a")
+    file:close()
+    return conteudo
+end
+
+-- Ler o conteúdo do arquivo
+local conteudo = lerArquivo(caminho_arquivo)
+
+-- Obtém a versão do cliente
+local version = Client.getVersion()
+
+-- Extrai o número principal da versão (ex: "14" de "14.10.db74b1")
+local majorVersion = tonumber(version:match("^(%d+)"))
+
+-- Define os caminhos corretos dependendo da versão
+if majorVersion and majorVersion >= 14 then
+    package.path = package.path .. ";" ..
+        Engine.getScriptsDirectory() .. "\\dlls_lib\\dll_64\\lua\\?.lua" .. ";" ..
+        Engine.getScriptsDirectory() .. "\\dlls_lib\\dll_64\\lua\\socket\\?.lua"
+    package.cpath = package.cpath .. ";" ..
+        Engine.getScriptsDirectory() .. "\\dlls_lib\\dll_64\\?.dll"
+else
+    package.path = package.path .. ";" ..
+        Engine.getScriptsDirectory() .. "\\dlls_lib\\lua\\?.lua" .. ";" ..
+        Engine.getScriptsDirectory() .. "\\dlls_lib\\lua\\socket\\?.lua"
+    package.cpath = package.cpath .. ";" ..
+        Engine.getScriptsDirectory() .. "\\dlls_lib\\?.dll"
+end
+
+local http = require("socket.http")
+local ltn12 = require("ltn12")
+
+-- Substitua pelos valores reais
+local project_id = "vonhotkey"
+local collection = "licenses"
+
+-- URL para acessar o Firestore (substitua o {customerEmail} pelo e-mail do usuário)
+local url = "https://firestore.googleapis.com/v1/projects/" .. project_id ..
+            "/databases/(default)/documents/" .. collection .. "/"
+
+
+-- Função para obter a data atual no formato Firestore
+local function get_firestore_timestamp(days_to_add)
+    local current_time = os.time()
+    local new_time = current_time + (days_to_add * 86400) -- Adiciona X dias em segundos
+    return os.date("!%Y-%m-%dT%H:%M:%SZ", new_time)
+end
+
+-- Função para buscar a licença do usuário
+local function get_license(email)
+    local response = {}
+    local _, status_code = http.request{
+        url = url .. email,
+        sink = ltn12.sink.table(response)
+    }
+
+    if status_code == 200 then
+        local data = table.concat(response)
+        return JSON.decode(data)
+    end
+    return nil
+end
+
+-- Função para atualizar ou criar uma licença no Firestore
+local function update_license(email)
+    local license = get_license(email)
+    local expiration_date
+
+    if license and license.fields and license.fields.expirationDate then
+        -- Se a licença já existe, adiciona mais 1 dia
+        local current_expiration = license.fields.expirationDate.timestampValue
+        local year, month, day = current_expiration:match("(%d+)-(%d+)-(%d+)")
+        local expiration_time = os.time({ year = tonumber(year), month = tonumber(month), day = tonumber(day) })
+        
+        if os.time() > expiration_time then
+            expiration_date = get_firestore_timestamp(1)  -- Se expirou, adiciona 1 dia
+        else
+            expiration_date = get_firestore_timestamp(1 + os.difftime(expiration_time, os.time()) / 86400)
+        end
+    else
+        -- Se não tem licença, cria uma nova com 1 dia grátis
+        expiration_date = get_firestore_timestamp(1)
+    end
+
+    -- Enviar requisição para o Firestore
+    local payload = JSON.encode({
+        fields = {
+            expirationDate = { timestampValue = expiration_date }
+        }
+    })
+    
+    local response_body = {}
+    local _, status_code = http.request{
+        url = url .. email .. "?updateMask.fieldPaths=expirationDate",
+        method = "PATCH",
+        headers = {
+            ["Content-Type"] = "application/json"
+        },
+        source = ltn12.source.string(payload),
+        sink = ltn12.sink.table(response_body)
+    }
+
+    if status_code == 200 then
+        print("Licença atualizada para " .. expiration_date)
+        return true
+    else
+        print("Erro ao atualizar licença:", table.concat(response_body))
+        return false
+    end
+end
+
+-- Função para calcular a diferença entre a data de expiração e a data atual
+local function calculate_time_remaining(expiration_timestamp)
+    -- Converte o timestamp do Firestore para uma tabela Lua
+    local expiration_time = os.time({
+        year = tonumber(string.sub(expiration_timestamp, 1, 4)),
+        month = tonumber(string.sub(expiration_timestamp, 6, 7)),
+        day = tonumber(string.sub(expiration_timestamp, 9, 10)),
+        hour = tonumber(string.sub(expiration_timestamp, 12, 13)),
+        min = tonumber(string.sub(expiration_timestamp, 15, 16)),
+        sec = tonumber(string.sub(expiration_timestamp, 18, 19))
+    })
+    
+    -- Obtém a data e hora atuais
+    local current_time = os.time()
+
+    -- Calcula a diferença em segundos
+    local seconds_remaining = expiration_time - current_time
+
+    if seconds_remaining < 0 then
+        return 0, 0, 0, 0  -- Se a data de expiração já passou
+    end
+
+    -- Calcula dias, horas, minutos e segundos
+    local days = math.floor(seconds_remaining / (60 * 60 * 24))  -- Convertendo de segundos para dias
+    seconds_remaining = seconds_remaining % (60 * 60 * 24)  -- Resto após calcular dias
+
+    local hours = math.floor(seconds_remaining / (60 * 60))  -- Calculando as horas restantes
+    seconds_remaining = seconds_remaining % (60 * 60)  -- Resto após calcular horas
+
+    local minutes = math.floor(seconds_remaining / 60)  -- Calculando os minutos restantes
+    local seconds = seconds_remaining % 60  -- Restante em segundos
+
+    return days, hours, minutes, seconds
+end
+
+-- Função para formatar a data no formato "dia/mês/ano" e a hora no formato "hora:minuto:segundo"
+local function format_expiration_date(expiration_timestamp)
+    -- Extrair as partes da data
+    local year = tonumber(string.sub(expiration_timestamp, 1, 4))
+    local month = tonumber(string.sub(expiration_timestamp, 6, 7))
+    local day = tonumber(string.sub(expiration_timestamp, 9, 10))
+    local hour = tonumber(string.sub(expiration_timestamp, 12, 13))
+    local min = tonumber(string.sub(expiration_timestamp, 15, 16))
+    local sec = tonumber(string.sub(expiration_timestamp, 18, 19))
+
+    -- Formatar a data e hora no formato desejado
+    local date = string.format("%02d/%02d/%04d", day, month, year)  -- Dia/Mês/Ano
+    local time = string.format("%02d:%02d:%02d", hour, min, sec)    -- Hora:Minuto:Segundo
+
+    return date, time
+end
+
+-- Função para fazer a requisição GET e processar a resposta
+local function get_firestore_data(url, email)
+    local response = {}
+    local _, status_code = http.request{
+        url = url .. email,
+        sink = ltn12.sink.table(response)
+    }
+
+    if status_code == 200 then
+        -- Concatena a resposta e imprime
+        local data = table.concat(response)
+
+        -- Parse da resposta JSON
+        local json_data = JSON.decode(data)
+        
+        -- Verifica se a data de expiração está presente
+        if json_data and json_data.fields and json_data.fields.expirationDate then
+            local expiration_timestamp = json_data.fields.expirationDate.timestampValue  -- A data está no campo "timestampValue"
+            
+            -- Formatar a data e hora
+            local expiration_date, expiration_time = format_expiration_date(expiration_timestamp)
+            
+            -- Calcula quantos dias, horas, minutos e segundos faltam
+            local days_left, hours_left, minutes_left, seconds_left = calculate_time_remaining(expiration_timestamp)
+            
+            -- Verifica se ainda há tempo restante
+            if days_left > 0 or hours_left > 0 or minutes_left > 0 or seconds_left > 0 then
+                -- Exibe o tempo restante formatado
+                print(string.format("Tempo restante: %d dias, %d horas, %d minutos, %d segundos", 
+                days_left, hours_left, minutes_left, seconds_left))
+                print("✅ Acesso liberado!")
+                liberado = true
+            else
+                print("Você não tem dias de licença suficiente.\nData de expiração: " .. expiration_date .. "\n❌ Acesso não liberado!")
+                liberado = false
+            end
+            
+            return days_left, hours_left, minutes_left, seconds_left
+        else
+            print("Erro: Licença não encontrada ou sem data de expiração.")
+            return nil
+        end
+    else
+        print("Licença não encontrada!\nAdquira uma licença para ter acesso.\n❌ Acesso não liberado!")
+        liberado = false
+        return nil
+    end
+end
+
+-- Chama a função para obter os dados e calcular o tempo restante
+
+
+if conteudo then
+    -- Pegar o e-mail usando regex
+    local email = conteudo:match('"email"%s*:%s*"([^"]+)"')
+    if email then
+        update_license(email)  -- Adiciona 1 dia automaticamente se necessário
+        wait(1000)
+        get_firestore_data(url, email)
+    else
+        print("Email não encontrado.")
+    end
+end
+
+-- URL do arquivo que você deseja ler
+local url = "https://raw.githubusercontent.com/ThauanGamer1/NewCavebot/refs/heads/main/newHud.lua"
+
+-- Função para obter o conteúdo da URL
+local function obterConteudoDaURL(url)
+	local response, status = http.request(url)
+	if status == 200 then
+		return response
+	else
+		print("Erro ao fazer download do script.", status)
+		return nil
+	end
+end
+
+-- Função para validar o conteúdo obtido
+local function validarConteudo(conteudo)
+	if conteudo and conteudo ~= "" then
+		return true
+	else
+		return false, "Conteúdo inválido."
+	end
+end
+
+-- Função para carregar e executar o conteúdo do script
+local function executarConteudo(conteudo)
+	local chunk, err = load(conteudo, "baixado", "t")
+	if chunk then
+		local success, result = pcall(chunk)
+		if not success then
+			print("Erro ao executar o script: ", result)
+		else
+			print("Script executado com sucesso.")
+		end
+	else
+		print("Erro ao carregar o script: ", err)
+	end
+end
+
+-- Função principal para baixar, validar e executar o script
+local function baixarEExecutarScript(url)
+	local conteudo = obterConteudoDaURL(url)
+	local isValid, errMsg = validarConteudo(conteudo)
+	if isValid then
+		executarConteudo(conteudo)
+	else
+		print("Erro: ", errMsg or "")
+	end
+end
+
+
+if liberado then   
+    -- Chame a função principal com a URL do seu script
+    baixarEExecutarScript(url)
+    print("executando...")      
+end
